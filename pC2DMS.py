@@ -529,7 +529,7 @@ class Scan:
 
         return optimized_weights, optimized_loss'''
     
-    def optimizeWeightsComparison(self, indexList, loss_function, scan_dir, weights=None, range_size=30):
+    def optimizeWeightsDifferential_evolution(self, indexList, loss_function, scan_dir, weights=None, range_size=30):
         """Optimizes weights using a combination of optimization algorithms."""
 
         # Generate initial guess of weights
