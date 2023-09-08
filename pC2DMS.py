@@ -41,7 +41,14 @@ from bayes_opt import BayesianOptimization
 from bayes_opt import UtilityFunction
 from scipy.optimize import differential_evolution, dual_annealing, minimize, Bounds
 import concurrent.futures
+import pyscipopt as scip
 from pyswarm import pso
+import pyswarms as ps
+import optuna
+import cloudpickle
+import dill
+import cma
+'''import nevergrad as ng'''
 
 class Scan:
     def __init__(self, scanFolder, AGCtarget=100):
@@ -139,14 +146,14 @@ class Scan:
         weights = stats.invgauss.rvs(loc=loc, scale=scale, size=size, mu=1)
         weights = weights / weights.mean()
         return weights
-
+    
     def generateInitialWeightsEqual(self, range_size=300):
         size = self.scanList.shape[1] // range_size
         # Generate an initial guess of the weights
         weights = np.ones(size)
         return weights
 
-    def optimizeWeights(self, indexList, loss_function, scan_dir, weights=None, range_size=30):
+    def optimizeWeights(self, indexList, loss_function, scan_dir, weights=None, range_size=100, optimizer_path='optimizer_bayopt.dill', iterations_per_run=1):
         """Optimizes weights using Bayesian Optimization algorithm."""
 
         # Generate initial guess of weights
@@ -158,11 +165,11 @@ class Scan:
         y0 = -loss_function(scan_dir, x0, indexList)
         y0 = np.squeeze(y0)  # remove any singleton dimensions
 
-        kernel = ConstantKernel() * RBF(length_scale=1.0) + Matern(length_scale=1.0, nu=1.5)
+        kernel = ConstantKernel(constant_value_bounds=(1e-12, 1e3)) + Matern(length_scale_bounds=(1e-12, 1e3), nu=1.5)
         gpr = GaussianProcessRegressor(
             kernel=kernel,
-            alpha=0.01,
-            n_restarts_optimizer=10
+            alpha=1e-6,
+            n_restarts_optimizer=50
         )
         X0 = x0.reshape(-1, 1).T
         y0 = y0.reshape(-1)  # Reshape y0 to have shape (n_samples,)
@@ -181,27 +188,307 @@ class Scan:
         # Update optimizer with surrogate model
         optimizer._gp = gpr
 
-        # Define optimizer with mixed acquisition functions
-        acq_func = [
-            {'acquisition': 'ucb', 'kappa': 1.0},
-            {'acquisition': 'ei'},
-            {'acquisition': 'poi'}
-        ]
+        # Load optimizer from disk if it exists
+        loaded_optimizer = None
+        if os.path.exists(optimizer_path):
+            with open(optimizer_path, 'rb') as f:
+                loaded_optimizer = dill.load(f)
 
-        # Set acquisition functions and their weights in the optimizer
-        optimizer.acq_funcs = acq_func
+        if loaded_optimizer is not None:
+            # Continue optimization using the existing optimizer
+            loaded_optimizer.maximize(init_points=0, n_iter=iterations_per_run)
 
-        # Run optimization
-        optimizer.maximize(init_points=5, n_iter=1000)
+            optimizer = loaded_optimizer
+
+            # Save the combined optimizer using dill
+            with open(optimizer_path, 'wb') as f:
+                dill.dump(optimizer, f)
+        else:
+            # Run optimization
+            optimizer.maximize(init_points=10, n_iter=iterations_per_run)
+
+            # Save the optimizer using dill
+            with open(optimizer_path, 'wb') as f:
+                dill.dump(optimizer, f)
 
         # Return optimized weights
         optimized_weights = np.array([optimizer.max['params'][f'w_{i}'] for i in range(len(weights))])
         optimized_loss = -optimizer.max['target']
 
         return optimized_weights, optimized_loss
+    
+    
+    def optimizeWeightsTPE(self, indexList, loss_function, scan_dir, weights=None, range_size=100, optimizer_path = "optimizer_tpe.dill"):
+        """Optimizes weights using Tree-structured Parzen Estimators (TPE) algorithm with Optuna."""
 
-    def optimizeWeightsComparison(self, indexList, loss_function, scan_dir, weights=None, range_size=30):
-        """Optimizes weights using a combination of optimization algorithms."""
+        # Generate initial guess of weights
+        if weights is None:
+            weights = self.generateInitialWeights(range_size)
+
+        # Define bounds for weights"""Optimizes weights using Tree-structured Parzen Estimators (TPE) algorithm with Optuna."""
+
+        # Generate initial guess of weights
+        if weights is None:
+            weights = self.generateInitialWeights(range_size)
+
+        # Define bounds for weights
+        bounds = [(0, 2) for _ in range(len(weights))]
+
+        # Define the objective function for optimization
+        def objective_function(trial):
+            trial_weights = [trial.suggest_float(f'w_{i}', 0, 2) for i in range(len(weights))]
+            return -loss_function(scan_dir, np.array(trial_weights), indexList)
+
+        # Load optimizer from disk if it exists
+        loaded_optimizer = None
+        if os.path.exists(optimizer_path):
+            with open(optimizer_path, "rb") as file:
+                loaded_optimizer = dill.load(file)
+
+        if loaded_optimizer is not None:
+            # Run optimization using the existing optimizer
+            trial = loaded_optimizer.ask()
+            loaded_optimizer.tell(trial, objective_function(trial))
+            # Save the optimizer after each trial
+            with open(optimizer_path, "wb") as file:
+                dill.dump(loaded_optimizer, file)
+        else:
+            # Create a new optimizer using Optuna
+            loaded_optimizer = optuna.create_study(
+                direction='maximize',
+                sampler=optuna.samplers.TPESampler(
+                    n_startup_trials=1,
+                    n_ei_candidates=24,
+                    seed=42
+                )
+            )
+            # Run optimization
+            trial = loaded_optimizer.ask()
+            loaded_optimizer.tell(trial, objective_function(trial))
+
+        # Save the optimizer
+        with open(optimizer_path, "wb") as file:
+            dill.dump(loaded_optimizer, file)
+
+        # Get the best weights and loss from the optimizer
+        optimized_weights = [loaded_optimizer.best_params[f'w_{i}'] for i in range(len(weights))]
+        optimized_loss = -loaded_optimizer.best_value
+
+        return optimized_weights, optimized_loss
+        bounds = [(0, 2) for _ in range(len(weights))]
+
+        # Define the objective function for optimization
+        def objective_function(trial):
+            trial_weights = [trial.suggest_float(f'w_{i}', 0, 2) for i in range(len(weights))]
+            return -loss_function(scan_dir, np.array(trial_weights), indexList)
+
+        # Load optimizer from disk if it exists
+        optimizer_path = "optimizer_tpe.dill"
+        loaded_optimizer = None
+        if os.path.exists(optimizer_path):
+            with open(optimizer_path, "rb") as file:
+                loaded_optimizer = dill.load(file)
+
+        if loaded_optimizer is not None:
+            # Run optimization using the existing optimizer
+            trial = loaded_optimizer.ask()
+            loaded_optimizer.tell(trial, objective_function(trial))
+            # Save the optimizer after each trial
+            with open(optimizer_path, "wb") as file:
+                dill.dump(loaded_optimizer, file)
+        else:
+            # Create a new optimizer using Optuna
+            loaded_optimizer = optuna.create_study(
+                direction='maximize',
+                sampler=optuna.samplers.TPESampler(
+                    n_startup_trials=1,
+                    n_ei_candidates=24,
+                    seed=42
+                )
+            )
+            trial = loaded_optimizer.ask()
+            loaded_optimizer.tell(trial, objective_function(trial))
+
+        # Save the optimizer
+        with open(optimizer_path, "wb") as file:
+            dill.dump(loaded_optimizer, file)
+
+        # Get the best weights and loss from the optimizer
+        optimized_weights = [loaded_optimizer.best_params[f'w_{i}'] for i in range(len(weights))]
+        optimized_loss = -loaded_optimizer.best_value
+
+        return optimized_weights, optimized_loss
+    
+    def optimizeWeightsPSO(self, indexList, loss_function, scan_dir, weights=None, range_size=30, iterations_per_run=1):
+        """Optimizes weights using the Particle Swarm Optimization (PSO) algorithm."""
+        
+        def save_optimizer(optimizer, filename):
+            """Save the optimizer's relevant attributes."""
+            optimizer_info = {
+                'n_particles': optimizer.n_particles,
+                'dimensions': optimizer.dimensions,
+                'options': optimizer.options,
+                'bounds': optimizer.bounds,
+                'best_pos': optimizer.swarm.best_pos,
+                'best_cost': optimizer.swarm.best_cost
+            }
+            with open(filename, 'wb') as file:
+                dill.dump(optimizer_info, file)
+
+        def load_optimizer(filename):
+            """Load the optimizer from the saved file."""
+            with open(filename, 'rb') as file:
+                optimizer_info = dill.load(file)
+            n_particles = optimizer_info['n_particles']
+            dimensions = optimizer_info['dimensions']
+            options = optimizer_info['options']
+            bounds = optimizer_info['bounds']
+            optimizer = ps.single.GlobalBestPSO(
+                n_particles=n_particles,
+                dimensions=dimensions,
+                options=options,
+                bounds=bounds
+            )
+            optimizer.swarm.best_pos = optimizer_info['best_pos']
+            optimizer.swarm.best_cost = optimizer_info['best_cost']
+            return optimizer
+
+        # Generate initial guess of weights
+        if weights is None:
+            weights = self.generateInitialWeights(range_size)
+
+        # Define bounds for weights
+        bounds = [(0, 2) for _ in range(len(weights))]
+
+        # Transform bounds into the expected format
+        lower_bounds = [b[0] for b in bounds]
+        upper_bounds = [b[1] for b in bounds]
+        bounds_tuple = (lower_bounds, upper_bounds)
+
+        # Define the objective function for optimization
+        def objective_function(x):
+            return -loss_function(scan_dir, x, indexList)
+
+        def step(optimizer, loss_function, scan_dir, indexList):
+            """Perform a single iteration (step) of Particle Swarm Optimization (PSO)."""
+            current_costs = []
+
+            for i in range(optimizer.n_particles):
+                particle = optimizer.swarm.position[i]
+                velocity = optimizer.swarm.velocity[i]
+                pbest = optimizer.swarm.pbest_pos[i]
+                best_global = optimizer.swarm.best_pos
+
+                # Update particle velocity
+                r1 = np.random.uniform(size=optimizer.dimensions)
+                r2 = np.random.uniform(size=optimizer.dimensions)
+                cognitive_component = optimizer.options['c1'] * r1 * (pbest - particle)
+                social_component = optimizer.options['c2'] * r2 * (best_global - particle)
+                inertia_weight = np.random.uniform(0.4, 0.9)
+                velocity = inertia_weight * velocity + cognitive_component + social_component
+
+                # Update particle position with constraint handling
+                particle = np.clip(particle + velocity, optimizer.bounds[0], optimizer.bounds[1])
+
+                # Update particle position and velocity in optimizer swarm
+                optimizer.swarm.position[i] = particle
+                optimizer.swarm.velocity[i] = velocity
+
+                # Evaluate particle fitness (cost)
+                weights_dict = {f'weight_{idx}': weight for idx, weight in enumerate(particle)}
+                weights_array = np.array([weight for weight in weights_dict.values()])
+                cost = loss_function(scan_dir, weights_array, indexList)
+                current_costs.append(cost)
+
+                # Update personal best (pbest) if improved
+                if cost < optimizer.swarm.pbest_cost[i]:  # Minimize the cost here
+                    optimizer.swarm.pbest_pos[i] = particle
+                    optimizer.swarm.pbest_cost[i] = cost
+
+                    # Update global best (gbest) if improved
+                    if cost < optimizer.swarm.best_cost:  # Minimize the cost here
+                        optimizer.swarm.best_pos = particle
+                        optimizer.swarm.best_cost = cost
+
+            optimizer.swarm.current_cost = np.array(current_costs)  # Update current_cost array
+
+            return optimizer
+
+        optimizer_path = "optimizer_pso.dill"
+    
+        if os.path.exists(optimizer_path):
+            optimizer = load_optimizer(optimizer_path)
+        else:
+            options = {'c1': 2.0, 'c2': 2.0, 'w': 0.5}
+            optimizer = ps.single.GlobalBestPSO(
+                n_particles=1,
+                dimensions=len(weights),
+                options=options,
+                bounds=bounds_tuple
+            )
+            optimizer.optimize(objective_function, iters=1)
+
+        # Perform optimization using the chosen optimizer
+        for _ in range(iterations_per_run):
+            optimizer = step(optimizer, loss_function, scan_dir, indexList)
+
+        # Save the optimizer's relevant attributes
+        save_optimizer(optimizer, optimizer_path)
+
+        # Return optimized weights
+        optimized_weights = optimizer.swarm.best_pos
+        optimized_loss = optimizer.swarm.best_cost
+
+        return optimized_weights, optimized_loss
+
+    
+    def optimizeWeightsCMA(self, indexList, loss_function, scan_dir, weights=None, range_size=30, optimizer_file = "optimizer_cma.dill", iterations_per_run=1):
+        """Optimizes weights using CMA-ES algorithm."""
+
+        # Generate initial guess of weights
+        if weights is None:
+            weights = self.generateInitialWeights(range_size)
+
+        # Define the objective function for optimization
+        def objective_function(x):
+            return loss_function(scan_dir, x, indexList)
+
+        # Check if the optimizer file exists and load the optimizer from disk
+        if os.path.exists(optimizer_file):
+            with open(optimizer_file, "rb") as file:
+                optimizer = dill.load(file)
+        else:
+            # Create a new optimizer using CMA if not loaded from disk
+            optimizer = cma.CMAEvolutionStrategy(x0=weights, sigma0=0.1)
+
+        # Number of iterations
+        num_iterations = iterations_per_run
+
+        for iteration in range(num_iterations):
+            # Get the next set of candidate solutions (weights)
+            candidates = optimizer.ask()
+
+            # Evaluate the objective function for each candidate
+            results = [objective_function(candidate) for candidate in candidates]
+
+            # Update the optimizer with the results (tell method)
+            optimizer.tell(candidates, results)
+
+            # Save the updated optimizer to disk (overwrite the existing one)
+            with open(optimizer_file, "wb") as file:
+                dill.dump(optimizer, file)
+
+            # Get the optimized weights
+            result = optimizer.result  # Retrieve the result object containing the best solution
+            optimized_weights = result.xbest
+            optimized_loss = result.fbest
+
+            print("Weights:", optimized_weights)
+            print("Loss:", optimized_loss)
+
+        return optimized_weights, optimized_loss
+    
+    '''def optimizeWeightsNg(self, indexList, loss_function, scan_dir, weights=None, range_size=30):
 
         # Generate initial guess of weights
         if weights is None:
@@ -214,6 +501,48 @@ class Scan:
         def objective_function(x):
             return -loss_function(scan_dir, x, indexList)
 
+        optimizer_file = "optimizer_ng.dill"
+
+        # Check if the optimizer file exists and load the optimizer from disk
+        if os.path.exists(optimizer_file):
+            with open(optimizer_file, "rb") as file:
+                optimizer = dill.load(file)
+        else:
+            # Create a new optimizer using nevergrad if not loaded from disk
+            parametrization = ng.p.Array(init=weights, lower=0, upper=2)
+            optimizer = ng.optimizers.NGOpt(parametrization=parametrization)
+
+        # Perform optimization using the existing optimizer
+        optimizer.maximize(init_points=0, n_iter=1, verbosity=1)
+
+        # Save the updated optimizer to disk
+        with open(optimizer_file, "wb") as file:
+            dill.dump(optimizer, file)
+
+        # Get the optimized weights
+        optimized_weights = optimizer.provide_recommendation().value
+        optimized_loss = -optimizer.provide_recommendation().loss
+
+        print("Optimization using nevergrad:")
+        print("Weights:", optimized_weights)
+        print("Loss:", optimized_loss)
+
+        return optimized_weights, optimized_loss'''
+    
+    def optimizeWeightsComparison(self, indexList, loss_function, scan_dir, weights=None, range_size=30):
+        """Optimizes weights using a combination of optimization algorithms."""
+
+        # Generate initial guess of weights
+        if weights is None:
+            weights = self.generateInitialWeights(range_size)
+        
+        # Define bounds for weights
+        bounds = [(0, 2) for _ in range(len(weights))]
+
+        # Define the objective function for optimization
+        def objective_function(x):
+            return -loss_function(scan_dir, x, indexList)
+        
         print("optimization using differential evolution:")
 
         # Perform optimization using differential evolution
@@ -222,11 +551,31 @@ class Scan:
         # Get the optimized weights
         optimized_weights_de = result_de.x
         optimized_loss_de = -result_de.fun
-        print('weights: ', optimized_weights)
-        print("Loss: ", optimized_loss)
+        print('weights: ', optimized_weights_de)
+        print("Loss: ", optimized_loss_de)
+
+        print("optimization using PySCIPOpt:")
+        
+        # Perform optimization using PySCIPOpt
+        model_scp = scip.Model()
+        weights_scp = [model_scp.addVar(lb=0, ub=2, name=f'w_{i}') for i in range(len(weights))]
+        loss_scp = loss_function(scan_dir, np.array(weights_scp), indexList)
+        model_scp.setObjective(-loss_scp)
+        model_scp.optimize()
+        optimized_weights_scp = np.array([model_scp.getVal(w) for w in weights_scp])
+        optimized_loss_scp = -model_scp.getObjVal()
+        print('weights: ', optimized_weights_scp)
+        print("Loss: ", optimized_loss_scp)
+
+        # Compare the optimized losses and choose the best
+        optimized_weights_list = [optimized_weights_de, optimized_weights_scp]
+        optimized_losses = [optimized_loss_de, optimized_loss_scp]
+        best_index = np.argmax(optimized_losses)
+        optimized_weights = optimized_weights_list[best_index]
+        optimized_loss = optimized_losses[best_index]
 
         return optimized_weights, optimized_loss
-
+    
     def optimizeWeightsDual_annealing(self, indexList, loss_function, scan_dir, weights=None, range_size=30):
         """Optimizes weights using the dual_annealing algorithm."""
 
@@ -253,9 +602,9 @@ class Scan:
         print("Loss:", optimized_loss)
 
         return optimized_weights, optimized_loss
-
-
-    def optimizeWeightsPSO(self, indexList, loss_function, scan_dir, weights=None, range_size=30):
+    
+    
+    def optimizeWeightsPSOFast(self, indexList, loss_function, scan_dir, weights=None, range_size=30):
         """Optimizes weights using the Particle Swarm Optimization (PSO) algorithm."""
 
         # Generate initial guess of weights
@@ -465,7 +814,7 @@ class Map:
                                    shFiltThr=shFiltThr, shFiltRef=shFiltRef, shFiltRad=shFiltRad, \
                                    breakTime=breakTime, boundFilt=True, boundLimit=pixOut, \
                                    returnDiscards=False)
-
+        
         # boundFilt must be true with boundLimit as pixOut for sampleFeats
         # to not raise an exception
 
@@ -481,7 +830,7 @@ class Map:
                     useT4R=False, saveAt=False, basePath=None, printAt=50):
         'Returns m/z\'s, volume and sig for feats with r,c in indexList'
         """pixOut is for peak dimensions, comPixOut is for centre of mass
-        routine, pixWidth is for peak integration (how many Da each pixel
+        routine, pixWidth is for peak integration (how many Da each pixel 
         corresponds to, if we care)."""
 
         self.Syx = self.syx()  # load this into RAM so it runs quicker!
@@ -535,15 +884,15 @@ class Map:
                             str(int(featNo)) + '.npy', featList[featNo - saveAt:featNo])
 
         return featList
-
-
+    
+    
     def sampleFeatsIndex(self, indexList, pixOut=15, comPixOut=3,
                     cutPeaks=True, integThresh=0, numRays=100, perimOffset=-0.5,
                     pixWidth=1, sampling='jackknife', bsRS=None, bsRS_diffs=None,
                     useT4R=False, saveAt=False, basePath=None, printAt=50):
         'Returns m/z\'s, volume and sig for feats with r,c in indexList'
         """pixOut is for peak dimensions, comPixOut is for centre of mass
-        routine, pixWidth is for peak integration (how many Da each pixel
+        routine, pixWidth is for peak integration (how many Da each pixel 
         corresponds to, if we care)."""
 
         self.Syx = self.syx()  # load this into RAM so it runs quicker!
@@ -594,7 +943,7 @@ class Map:
                             str(int(featNo)) + '.npy', featList[featNo - saveAt:featNo])
 
         return featList
-
+    
     def topNfeats(self, numFeats, clearRad=25, chemFilt=[], chemFiltTol=2.0,
                   shapeFilt=False, shFiltThr=-0.2, shFiltRef='map',\
                   shFiltRad=15, boundFilt=True, boundLimit=15, breakTime=3600,\
@@ -769,8 +1118,8 @@ class Peak:
         self.array = array
 
     def com(self, pixEachSide=3):
-        """Returns the row and column index of the centre of mass of a square
-        on the 2D array 'array', centred on the pixel indexed by r, c and of
+        """Returns the row and column index of the centre of mass of a square 
+        on the 2D array 'array', centred on the pixel indexed by r, c and of 
         width (2 * pixEachSide + 1)"""
 
         square = np.zeros((2 * pixEachSide + 1, 2 * pixEachSide + 1))
@@ -886,7 +1235,7 @@ class Peak:
             for i3 in range(-1, -(rad + 1), -1):
                 if i3 < boundDown1:
                     peakShape[rad + i3, rad + j3] = False
-        #
+        #            
         # Quadrant 4
         m = north / float(west)
         for j4 in range(-1, -(rad + 1), -1):
@@ -902,7 +1251,7 @@ class Peak:
         "Return boolean template of peak, created by joining end of N rays"
         """integThresh condition is <=. r_i and c_i are row and column indices
         to cast rays from. perimOffset is perimeter offset - offset between
-        vertices and the perimeter of the template outline (passed as radius
+        vertices and the perimeter of the template outline (passed as radius 
         to Path.contains_points() method)."""
 
         array = self.array
@@ -994,7 +1343,7 @@ class Peak:
         return line
 
     def fwhm(self, axis, plot=False, inDa=False, outforlo=0):
-        # the 'x' FWHM is the FWHM *across* the c dimension, and so the FWHM
+        # the 'x' FWHM is the FWHM *across* the c dimension, and so the FWHM 
         # *along* the m/z indexed by self.r. outforlo is 'pixels out for line\
         # out', i.e. take the lineout for the univariate spline going out how
         # many pixels each side?
@@ -1067,7 +1416,7 @@ class CovPeak(Peak):
                    np.matrix(Sx)
 
             # Number of scans for each partial covariance square on the resample
-            # = numScans - 1
+            # = numScans - 1            
             covSquare = Peak((Syx - SySx / (numScans - 1)) / (numScans - 2))
 
             if cutPeak:
@@ -1078,7 +1427,7 @@ class CovPeak(Peak):
             covSum += vol
             covSumSqd += vol ** 2
 
-        return (covSumSqd - (covSum ** 2) / (numScans)) / numScans  # this should
+        return (covSumSqd - (covSum ** 2) / (numScans)) / numScans * (numScans-1)  # this should
         # include Bessel's correction, but has not historically. Because we are
         # currently unconcerned with absolute value of stdDev but do want
         # to compare with previous results, omit for now.
@@ -1113,7 +1462,7 @@ class CovPeak(Peak):
     def reCentre2(self, maxChange=3):
         """For when you are not entirely sure where the maximum is. Max change
         is the number of pixels you are willing to change x and y by. Instead
-        of printing, this returns change_in_r,change_in_c and rebuilds the
+        of printing, this returns change_in_r,change_in_c and rebuilds the 
         peak array (as well as changing self.r & self.c)"""
         rf, cf = maxIndices(self.array \
                                 [self.pixOut - maxChange:self.pixOut + maxChange + 1, \
@@ -1397,7 +1746,7 @@ class PCovPeak(CovPeak):
             pCovSum += vol
             pCovSumSqd += vol ** 2
 
-        return (pCovSumSqd - (pCovSum ** 2) / (numScans)) / numScans  # this should
+        return (pCovSumSqd - (pCovSum ** 2) / (numScans)) / numScans * (numScans-1)  # this should
         # include Bessel's correction, but has not historically. Because we are
         # currently unconcerned with absolute value of stdDev but do want
         # to compare with previous results, omit for now.

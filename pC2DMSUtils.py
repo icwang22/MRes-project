@@ -787,7 +787,8 @@ def readTextFile(textFile, scanFolder, numscanInterval=None):
     # cause it was useless
     print('Reading file ' + textFile + ' to ' + fullScanFolder)
 
-    os.mkdir(fullScanFolder)
+    if not os.path.exists(fullScanFolder):
+        os.mkdir(fullScanFolder)
 
     startLine = 24  # line tells you number of readings
     lineWithPacket = 36  # line of first packet
@@ -872,14 +873,14 @@ def readTextFile(textFile, scanFolder, numscanInterval=None):
     params = np.zeros(8)
 
     params[0] = numSlices
-    params[1] = 9000 # Total number of scans read in to the array. For some
+    params[1] = scan# Total number of scans read in to the array. For some
     # reason, historically sometimes not all scans declared at the top of the
     # text file have been read in. It has been found that when this happens,
     # it does not affect the other scans that are read in to the array.
     # The problem might be a result of manual interference with the Python
     # console  as it is running, so advise not to check variables etc. until
     # all is finished.
-    params[2] = 9000  # Total number of scans specified at top of text file.
+    params[2] = numScans  # Total number of scans specified at top of text file.
     # See above, historically it has sometimes been the case that this number
     # is larger than the number of scans actually read in.
     sliceSize = np.average(np.diff(array[0, :]))  # Computational limits (i.e.
@@ -901,13 +902,14 @@ def readTextFile(textFile, scanFolder, numscanInterval=None):
     array = array[:scan + 1, :]  # truncates the array on the occasion that the
     # number of scans read in is lower than the number of scans declared at the
     # text file, see above.
-    array = array[:9001]
+    # array = array[:9001]
 
     if numscanInterval is not None:
         if os.path.basename(fullScanFolder) != str(numScans) + ' scans':
             os.rmdir(fullScanFolder)
             fullScanFolder = os.path.abspath(os.path.join(fullScanFolder, os.pardir)) + '/' + str(numScans) + ' scans'
-            os.makedirs(fullScanFolder)
+            if not os.path.exists(fullScanFolder):
+                os.makedirs(fullScanFolder)
 
     np.save(fullScanFolder + '/array.npy', array)
     np.save(fullScanFolder + '/array_parameters.npy', params)
